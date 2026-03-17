@@ -1,0 +1,346 @@
+import os
+import random
+import numpy as np
+import tensorflow as tf
+import subprocess
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+DATA_DIR = "/content/dataset_nato"
+MODEL_PATH = "nato_asr_model.keras"
+
+TARGET_SR = 16000
+CLIP_SAMPLES = 16000  # 1 секунда
+N_MELS = 64
+FRAME_LENGTH = 480
+FRAME_STEP = 160
+FFT_LENGTH = 512
+
+NATO = ["alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel","india","juliett",
+        "kilo","lima","mike","november","oscar","papa","quebec","romeo","sierra","tango",
+        "uniform","victor","whiskey","xray","yankee","zulu"]
+DIGITS = ["zero","one","two","three","four","five","six","seven","eight","nine"]
+VOCAB = NATO + DIGITS
+NUM_CLASSES = len(VOCAB)
+
+WORD_TO_ID = {w: i for i, w in enumerate(VOCAB)}
+ID_TO_WORD = {i: w for w, i in WORD_TO_ID.items()}
+WORD_TO_CHAR = {**{w: chr(ord('A')+i) for i, w in enumerate(NATO)},
+                **{d: str(i) for i, d in enumerate(DIGITS)}}
+
+
+@tf.function
+def get_log_mel_spec(audio):
+    # Нормалізація амплітуди
+    audio = audio - tf.reduce_mean(audio)
+    audio = audio / (tf.math.reduce_std(audio) + 1e-6)
+
+    stft = tf.signal.stft(audio, frame_length=FRAME_LENGTH, frame_step=FRAME_STEP, fft_length=FFT_LENGTH)
+    spectrogram = tf.abs(stft)
+
+    mel_weight_matrix = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=N_MELS, num_spectrogram_bins=FFT_LENGTH // 2 + 1,
+        sample_rate=TARGET_SR, lower_edge_hertz=80.0, upper_edge_hertz=7600.0)
+
+    mel_spec = tf.matmul(spectrogram, mel_weight_matrix)
+    log_mel_spec = tf.math.log(mel_spec + 1e-10)
+
+    # Resize до фіксованого розміру (100 часових кроків, 64 мели)
+    log_mel_spec = tf.image.resize(log_mel_spec[..., tf.newaxis], (100, N_MELS))
+    return log_mel_spec
+
+def preprocess_audio(path):
+    audio_bin = tf.io.read_file(path)
+    audio, _ = tf.audio.decode_wav(audio_bin, desired_channels=1)
+    audio = tf.squeeze(audio, axis=-1)
+
+    # Центрування та доведення до 1 сек
+    curr_len = tf.shape(audio)[0]
+    if curr_len > CLIP_SAMPLES:
+        audio = audio[:CLIP_SAMPLES]
+    else:
+        pad_size = CLIP_SAMPLES - curr_len
+        audio = tf.pad(audio, [[pad_size // 2, pad_size - (pad_size // 2)]])
+
+    return get_log_mel_spec(audio)
+
+
+def build_model(input_shape=(100, 64, 1)):
+    inputs = tf.keras.Input(shape=input_shape)
+
+    def conv_block(x, filters):
+        x = tf.keras.layers.Conv2D(filters, 3, padding='same')(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation('relu')(x)
+        x = tf.keras.layers.MaxPooling2D()(x)
+        return x
+
+    x = conv_block(inputs, 32)
+    x = conv_block(x, 64)
+    x = conv_block(x, 128)
+    x = conv_block(x, 256)
+
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(256, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    outputs = tf.keras.layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+    model = tf.keras.Model(inputs, outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+
+def get_data_splits():
+    paths, labels = [], []
+    for word in VOCAB:
+        wdir = os.path.join(DATA_DIR, word)
+        if not os.path.isdir(wdir): continue
+        for f in os.listdir(wdir):
+            if f.endswith(".wav"):
+                paths.append(os.path.join(wdir, f))
+                labels.append(WORD_TO_ID[word])
+
+    combined = list(zip(paths, labels))
+    random.shuffle(combined)
+    paths, labels = zip(*combined)
+
+    n = len(paths)
+    v_idx, t_idx = int(n * 0.7), int(n * 0.85)
+    return (paths[:v_idx], labels[:v_idx]), (paths[v_idx:t_idx], labels[v_idx:t_idx]), (paths[t_idx:], labels[t_idx:])
+
+def make_ds(p, l, train=True):
+    ds = tf.data.Dataset.from_tensor_slices((list(p), list(l)))
+    ds = ds.map(lambda x, y: (preprocess_audio(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+    if train: ds = ds.shuffle(1000)
+    return ds.batch(32).prefetch(tf.data.AUTOTUNE)
+
+
+def simple_vad(audio_np, sr=16000, threshold=0.02):
+    """Розділяє довгий запис на окремі слова."""
+    win = int(sr * 0.05)
+    step = int(sr * 0.02)
+    segments = []
+    active = False
+    start = 0
+
+    for i in range(0, len(audio_np)-win, step):
+        energy = np.sqrt(np.mean(audio_np[i:i+win]**2))
+        if energy > threshold and not active:
+            active = True
+            start = i
+        elif energy < threshold * 0.7 and active:
+            active = False
+            if (i - start) > sr * 0.1: # мінімум 100мс
+                segments.append(audio_np[max(0, start-1000): i+1000])
+    return segments
+
+def recognize(model, path):
+    # Конвертація якщо треба
+    if not path.endswith(".wav"):
+        new_p = "temp.wav"
+        subprocess.run(["ffmpeg", "-y", "-i", path, "-ar", "16000", "-ac", "1", new_p], check=True, capture_output=True)
+        path = new_p
+
+    audio_bin = tf.io.read_file(path)
+    audio, _ = tf.audio.decode_wav(audio_bin)
+    audio_np = tf.squeeze(audio).numpy()
+
+    words = simple_vad(audio_np)
+    result = []
+
+    for w_audio in words:
+        # Падинг до 1 сек
+        if len(w_audio) < CLIP_SAMPLES:
+            w_audio = np.pad(w_audio, (0, CLIP_SAMPLES - len(w_audio)))
+        else:
+            w_audio = w_audio[:CLIP_SAMPLES]
+
+        spec = get_log_mel_spec(tf.convert_to_tensor(w_audio, dtype=tf.float32))
+        pred = model.predict(tf.expand_dims(spec, 0), verbose=0)
+        idx = np.argmax(pred)
+        conf = np.max(pred)
+
+        if conf > 0.4: # Поріг впевненості
+            word = ID_TO_WORD[idx]
+            result.append((word, conf))
+
+    callsign = "".join([WORD_TO_CHAR[w[0]] for w in result])
+    return callsign, result
+
+
+if __name__ == "__main__":
+    if not os.path.exists(MODEL_PATH):
+        print("Навчання...")
+        (tp, tl), (vp, vl), (tsp, tsl) = get_data_splits()
+        train_ds = make_ds(tp, tl)
+        val_ds = make_ds(vp, vl, train=False)
+
+        model = build_model()
+        model.fit(train_ds, validation_data=val_ds, epochs=15,
+                  callbacks=[tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)])
+        model.save(MODEL_PATH)
+    else:
+        print("Завантаження готової моделі...")
+        model = tf.keras.models.load_model(MODEL_PATH)
+
+    test_file = "/content/Test2_16k.wav"
+    if os.path.exists(test_file):
+        code, details = recognize(model, test_file)
+        print(f"\nРезультат: {code}")
+        for w, c in details:
+            print(f" - {w} ({c:.2%})")
+
+
+
+
+import os, re, random, asyncio
+from pathlib import Path
+
+OUT_DIR = "/content/dataset_nato"
+SAMPLES_PER_CLASS = 120
+
+# Зміна швидкості та висоти тону
+RATES   = ["-15%","-10%","-5%","+0%","+5%","+10%","+15%"]
+PITCHES = ["-4Hz","-2Hz","+0Hz","+2Hz","+4Hz"]
+
+# Словник класів
+NATO = [
+    "alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel","india","juliett",
+    "kilo","lima","mike","november","oscar","papa","quebec","romeo","sierra","tango",
+    "uniform","victor","whiskey","xray","yankee","zulu"
+]
+DIGITS = ["zero","one","two","three","four","five","six","seven","eight","nine"]
+VOCAB = NATO + DIGITS
+
+def slugify(text: str):
+    text = text.lower().strip()
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+async def get_voices():
+    # Отримання списку доступних нейронних голосів
+    import edge_tts
+    vm = await edge_tts.VoicesManager.create()
+    voices = vm.voices
+
+    # Відбираємо якісні англомовні голоси з різними акцентами (США, Британія, Австралія)
+    preferred = [
+        "en-US-JennyNeural","en-US-GuyNeural",
+        "en-GB-SoniaNeural","en-GB-RyanNeural",
+        "en-AU-NatashaNeural","en-AU-WilliamNeural",
+    ]
+    available = {v["ShortName"] for v in voices}
+    chosen = [v for v in preferred if v in available]
+
+    if not chosen:
+        raise RuntimeError("Не знайдено необхідних англомовних нейронних голосів.")
+    return chosen
+
+async def synth_one(word: str, out_wav: Path, voice: str, rate: str, pitch: str):
+    import edge_tts
+    from pydub import AudioSegment
+
+    tmp_mp3 = out_wav.with_suffix(".mp3")
+
+    # Генерація аудіо за допомогою ШІ-сервісу
+    communicate = edge_tts.Communicate(text=word, voice=voice, rate=rate, pitch=pitch)
+    await communicate.save(str(tmp_mp3))
+
+    # Стандартизація даних: конвертація у WAV, 16 кГц, моноканал
+    # Це необхідно для коректної роботи спектрограм у CNN
+    audio = AudioSegment.from_file(tmp_mp3, format="mp3")
+    audio = audio.set_frame_rate(16000).set_channels(1)
+    audio.export(out_wav, format="wav")
+
+    try:
+        tmp_mp3.unlink() # Видалення тимчасового файлу
+    except Exception:
+        pass
+
+async def generate_dataset():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    voices = await get_voices()
+    print(f"Використовуються голоси: {len(voices)} шт.")
+
+    total = len(VOCAB) * SAMPLES_PER_CLASS
+    done = 0
+
+    for word in VOCAB:
+        class_dir = Path(OUT_DIR) / word
+        class_dir.mkdir(parents=True, exist_ok=True)
+
+        for i in range(SAMPLES_PER_CLASS):
+            voice = random.choice(voices)
+            rate  = random.choice(RATES)
+            pitch = random.choice(PITCHES)
+
+            fname = f"{slugify(word)}_{i:04d}_{slugify(voice)}.wav"
+            out_path = class_dir / fname
+
+            await synth_one(word, out_path, voice, rate, pitch)
+
+            done += 1
+            if done % 50 == 0 or done == total:
+                print(f"Згенеровано: {done}/{total} файлів")
+
+    print(f"Готово! Датасет збережено у: {OUT_DIR}")
+
+await generate_dataset()
+
+
+
+
+
+import random
+import asyncio
+from pathlib import Path
+import edge_tts
+from pydub import AudioSegment
+
+# Налаштування
+TEST_FILE_PATH = "/content/Test2_16k.wav"
+RATES   = ["-10%", "-5%", "+0%", "+5%"]
+PITCHES = ["-2Hz", "+0Hz", "+2Hz"]
+
+async def generate_test_callsign(callsign_text: str, out_path: str):
+    """
+    Генерує довгий запис для тестування.
+    """
+    vm = await edge_tts.VoicesManager.create()
+    # Використовуємо один якісний голос для тесту
+    voice = "en-US-GuyNeural"
+    rate = random.choice(RATES)
+    pitch = random.choice(PITCHES)
+
+    # Створюємо порожній сегмент для збору фрази
+    final_audio = AudioSegment.empty()
+
+    words = callsign_text.lower().split()
+    print(f"Генерація тестового файлу: {callsign_text.upper()}")
+
+    for word in words:
+        tmp_mp3 = "tmp_word.mp3"
+        communicate = edge_tts.Communicate(text=word, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(tmp_mp3)
+
+        # Завантажуємо слово
+        word_segment = AudioSegment.from_file(tmp_mp3, format="mp3")
+
+        # Додаємо слово + 300мс тиші після нього (щоб VAD спрацював чітко)
+        final_audio += word_segment
+        final_audio += AudioSegment.silent(duration=300)
+
+        Path(tmp_mp3).unlink()
+
+    # Стандартизація під модель: 16кГц, Моно
+    final_audio = final_audio.set_frame_rate(16000).set_channels(1)
+    final_audio.export(out_path, format="wav")
+    print(f"Файл успішно збережено за шляхом: {out_path}")
+
+test_phrase = "Golf Romeo One Five Seven"
+await generate_test_callsign(test_phrase, TEST_FILE_PATH)
+
