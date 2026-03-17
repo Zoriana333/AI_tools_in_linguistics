@@ -2,7 +2,7 @@
 
 import google.generativeai as genai
 
-API_KEY = "AIzaSyByJwhXe9bz07HwwuX7N66tnZadoiJNBSE"
+API_KEY = ""
 genai.configure(api_key=API_KEY)
 
 SYSTEM_STYLE = (
