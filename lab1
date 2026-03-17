@@ -1,0 +1,232 @@
+import os
+import numpy as np
+import cv2
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import matplotlib.pyplot as plt
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+BATCH_SIZE = 128
+EPOCHS = 3
+VAL_FRACTION = 0.1
+IMG_SIZE = 28
+DATASET_NAME = "emnist/byclass" # 62 класи: цифри (0-9) та літери (a-z, A-Z)
+MODEL_PATH = "emnist_ocr_cnn.keras"
+
+# Препроцесинг даних
+def preprocess_example(example):
+    x = tf.cast(example["image"], tf.float32) / 255.0
+
+    # Датасет EMNIST за замовчуванням повернутий на 90 градусів.
+    # Тому виконуємо транспонування для нормалізації.
+    x = tf.image.transpose(x)
+    y = example["label"]
+
+    return x, y
+
+def make_splits_and_load(dataset_name=DATASET_NAME):
+    # Завантаження сирих даних з TensorFlow Datasets
+    ds_train = tfds.load(dataset_name, split="train", as_supervised=False, shuffle_files=True)
+    ds_test  = tfds.load(dataset_name, split="test",  as_supervised=False, shuffle_files=False)
+
+    info = tfds.builder(dataset_name).info
+    n_train = info.splits["train"].num_examples
+
+    # Виділення валідаційної вибірки (10%) для контролю перенавчання (overfitting)
+    val_size = int(n_train * VAL_FRACTION)
+
+    ds_train = ds_train.shuffle(10_000, seed=SEED, reshuffle_each_iteration=True)
+    ds_val = ds_train.take(val_size)
+    ds_train = ds_train.skip(val_size)
+
+    # Оптимізація пайплайну: паралельна обробка (map), пакетування (batch) та префетчинг
+    AUTOTUNE = tf.data.AUTOTUNE
+    ds_train = ds_train.map(preprocess_example, num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
+    ds_val = ds_val.map(preprocess_example, num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
+    ds_test = ds_test.map(preprocess_example, num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
+
+    return ds_train, ds_val, ds_test, info
+
+# Архітектура згорткової нейронної мережі (CNN)
+def build_model(num_classes: int):
+    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
+
+    # Згорткові шари (Conv2D) виділяють ознаки (краї, кути, лінії)
+    x = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(inputs)
+    x = tf.keras.layers.MaxPooling2D()(x) # Зменшення розмірності (пулінг)
+
+    x = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+
+    x = tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu")(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+
+    x = tf.keras.layers.Dropout(0.25)(x) # Dropout вимикає частину нейронів, запобігаючи перенавчанню
+
+    x = tf.keras.layers.Flatten()(x) # Розгортання тензора у вектор для повнозв'язних шарів
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.35)(x)
+
+    # Вихідний шар: функція softmax видає ймовірності для кожного класу
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+
+    model = tf.keras.Model(inputs, outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    return model
+
+# Навчання моделі
+def train_and_evaluate():
+    ds_train, ds_val, ds_test, info = make_splits_and_load(DATASET_NAME)
+    num_classes = info.features["label"].num_classes
+
+    model = build_model(num_classes)
+
+    # Callbacks: EarlyStopping зупинить навчання, якщо точність на валідації перестане рости
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=2, restore_best_weights=True),
+        tf.keras.callbacks.ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", save_best_only=True),
+    ]
+
+    model.fit(ds_train, validation_data=ds_val, epochs=EPOCHS, callbacks=callbacks)
+
+    test_loss, test_acc = model.evaluate(ds_test, verbose=1)
+    print(f"\nТочність на тестових даних: {test_acc:.4f}")
+
+    return model, info
+
+# сегментація тексту на окремі символи
+def segment_characters_from_image(img_bgr_or_gray):
+    if len(img_bgr_or_gray.shape) == 3:
+        gray = cv2.cvtColor(img_bgr_or_gray, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_bgr_or_gray.copy()
+
+    # автоматично підбирає поріг для розділення фону і тексту
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    # Для пошуку контурів фон має бути чорним (0), а текст - білим (255)
+    if np.mean(thr) > 127:
+        thr = cv2.bitwise_not(thr)
+
+    # видалення шуму та об'єднання розірваних штрихів літер
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    clean = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Пошук контурів (обмежних рамок) для кожного символу
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w * h < 30 or h < 8 or w < 3: # Фільтрація дрібного шуму
+            continue
+        boxes.append((x, y, w, h))
+
+    boxes.sort(key=lambda b: b[0]) # Сортування знайдених символів зліва направо
+
+    chars = []
+    for (x, y, w, h) in boxes:
+        crop = clean[y:y+h, x:x+w]
+        crop = crop.astype(np.uint8)
+
+        # Додавання паддінгу, щоб символ не був деформований (розтягнутий) при зміні розміру до 28x28
+        hh, ww = crop.shape
+        side = max(hh, ww)
+        pad_y = (side - hh) // 2
+        pad_x = (side - ww) // 2
+        square = cv2.copyMakeBorder(crop, pad_y, side - hh - pad_y, pad_x, side - ww - pad_x,
+                                    cv2.BORDER_CONSTANT, value=0)
+
+        resized = cv2.resize(square, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+
+        # Нормалізація значень пікселів до діапазону [0..1]
+        x_img = (resized.astype(np.float32) / 255.0)[..., None]
+        chars.append((x_img, (x, y, w, h)))
+
+    return chars
+
+# Інференс (застосування моделі для розпізнавання)
+def recognize_text(model, info, image_path: str):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Не можна прочитати зображення: {image_path}")
+
+    segments = segment_characters_from_image(img)
+    if len(segments) == 0:
+        return "", []
+
+    x_batch = np.stack([s[0] for s in segments], axis=0)
+
+    # Отримання прогнозів моделі (ймовірнісний розподіл)
+    probs = model.predict(x_batch, verbose=0)
+    pred_ids = np.argmax(probs, axis=1) # Індекси класів з найвищою ймовірністю
+    confs = np.max(probs, axis=1)       # Значення впевненості моделі (0-1)
+
+    # Перетворення числових індексів назад у символ
+    chars = []
+    for i in pred_ids:
+        if i < 10:
+            chars.append(chr(i + 48))      # Цифри 0-9
+        elif i < 36:
+            chars.append(chr(i - 10 + 65)) # Великі літери A-Z
+        else:
+            chars.append(chr(i - 36 + 97)) # Малі літери a-z
+
+    text = "".join(chars)
+
+    details = [{"char": ch, "confidence": float(cf), "bbox": bbox}
+               for (x_img, bbox), ch, cf in zip(segments, chars, confs)]
+
+    return text, details
+
+if __name__ == "__main__":
+    # Завантаження збережених ваг або ініціалізація нового навчання
+    if os.path.exists(MODEL_PATH):
+        print(f"Завантаження готової моделі: {MODEL_PATH}")
+        model = tf.keras.models.load_model(MODEL_PATH)
+        info = tfds.builder(DATASET_NAME).info
+    else:
+        model, info = train_and_evaluate()
+
+    SAMPLE_IMAGE = "/content/sample_text.png"
+    if os.path.exists(SAMPLE_IMAGE):
+        text, details = recognize_text(model, info, SAMPLE_IMAGE)
+        print("\nРозпізнаний текст:", text)
+        for d in details:
+            print(f"Символ: {d['char']:<2} | Впевненість: {d['confidence']:.2f} | Координати: {d['bbox']}")
+
+
+        img_bgr = cv2.imread(SAMPLE_IMAGE)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        img_annotated = img_rgb.copy()
+
+        for d in details:
+            x, y, w, h = d['bbox']
+            char = d['char']
+            cv2.rectangle(img_annotated, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(img_annotated, char, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, 2, 1)
+        plt.title("Оригінал (фото)")
+        plt.imshow(img_rgb)
+        plt.axis('off')
+
+        plt.subplot(1, 2, 2)
+        plt.title(f"Результат розпізнавання: {text}")
+        plt.imshow(img_annotated)
+        plt.axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        print(f"\nСтворіть зображення '{SAMPLE_IMAGE}' з текстом для перевірки розпізнавання.")
