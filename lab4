@@ -1,0 +1,136 @@
+# !pip -q install gTTS gradio
+
+import gradio as gr
+from gtts import gTTS
+import uuid
+import random
+
+UA_EXAMPLES = [
+    "Іноді достатньо лише кількох слів, щоб голос комп’ютера ожив і передав настрій, який ти вклав у текст.",
+    "Уяви, як твої думки набувають звучання — тепер текст більше не мовчить, він говорить до світу.",
+    "Технології змінюють реальність: ще вчора це були лише літери, а сьогодні — теплий голос, що читає їх уголос."
+]
+
+EN_EXAMPLES = [
+    "Sometimes a few written words are enough to turn into a voice that carries emotion and meaning.",
+    "Imagine your thoughts coming alive as sound, no longer silent on the screen but speaking out loud.",
+    "Technology transforms simple text into a living voice that can inspire, inform, and connect."
+]
+
+def generate_audio(text, language, slow, history):
+    if text is None or text.strip() == "":
+        return None, history, "Введіть текст."
+
+    lang_code = "uk" if language == "Українська" else "en"
+
+    file_path = f"tts_{lang_code}_{uuid.uuid4().hex}.mp3"
+    gTTS(text=text.strip(), lang=lang_code, slow=slow).save(file_path)
+
+    history = history or []
+    history = [file_path] + history
+    history = history[:5]
+
+    return file_path, history, "Аудіо створено."
+
+def insert_example(language):
+    if language == "Українська":
+        return random.choice(UA_EXAMPLES)
+    return random.choice(EN_EXAMPLES)
+
+def clear_all():
+    return "", "Українська", False, None, [], "", []
+
+def clear_history():
+    return [], []
+
+with gr.Blocks(title="Text-to-Speech Web App") as app:
+
+    gr.Markdown("# Генерування мовлення")
+    gr.Markdown("Веб-додаток для перетворення тексту на аудіо у форматі MP3.")
+
+    with gr.Tabs():
+
+        with gr.TabItem("Головна"):
+            with gr.Row():
+                with gr.Column(scale=2):
+
+                    text_input = gr.Textbox(
+                        label="Введіть текст",
+                        lines=9,
+                        placeholder="Введіть текст..."
+                    )
+
+                    language_choice = gr.Radio(
+                        ["Українська", "Англійська"],
+                        value="Українська",
+                        label="Мова"
+                    )
+
+                    slow_mode = gr.Checkbox(label="Повільніше читання", value=False)
+
+                    with gr.Row():
+                        example_button = gr.Button("Вставити приклад")
+                        clear_button = gr.Button("Очистити")
+
+                    generate_button = gr.Button("Згенерувати MP3")
+                    status = gr.Markdown("")
+
+                with gr.Column(scale=1):
+                    audio_output = gr.Audio(label="Аудіо", type="filepath")
+                    history_state = gr.State([])
+                    history_files = gr.Files(label="Останні згенеровані файли", interactive=False)
+                    clear_history_button = gr.Button("Очистити історію")
+
+            example_button.click(
+                fn=insert_example,
+                inputs=language_choice,
+                outputs=text_input
+            )
+
+            clear_button.click(
+                fn=clear_all,
+                inputs=None,
+                outputs=[text_input, language_choice, slow_mode, audio_output]
+            )
+
+            clear_history_button.click(
+                fn=clear_history,
+                inputs=None,
+                outputs=[history_state, history_files]
+            )
+
+            generate_button.click(
+                fn=generate_audio,
+                inputs=[text_input, language_choice, slow_mode, history_state],
+                outputs=[audio_output, history_state, status]
+            ).then(
+                fn=lambda h: h,
+                inputs=history_state,
+                outputs=history_files
+            )
+
+        with gr.TabItem("Про додаток"):
+            gr.Markdown(
+                """
+                Додаток реалізує перетворення тексту на мовлення.
+
+                Використані технології:
+                - Python
+                - gTTS (API для генерації мовлення)
+                - Gradio (веб-інтерфейс)
+
+                Підтримуються мови:
+                - Українська
+                - Англійська
+
+                Функціональність:
+                - введення тексту;
+                - вибір мови;
+                - генерація MP3-файлу;
+                - режим повільнішого читання;
+                - приклади текстів для кожної мови (кілька варіантів);
+                - збереження історії останніх згенерованих аудіофайлів.
+                """
+            )
+
+app.launch(share=True)
