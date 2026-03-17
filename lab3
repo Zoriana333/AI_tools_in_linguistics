@@ -1,0 +1,54 @@
+!pip -q install -U google-generativeai
+
+import google.generativeai as genai
+
+API_KEY = "AIzaSyByJwhXe9bz07HwwuX7N66tnZadoiJNBSE"
+genai.configure(api_key=API_KEY)
+
+SYSTEM_STYLE = (
+    "Ти дружній українськомовний співрозмовник. "
+    "Відповідай природно, по-людськи, чітко і ввічливо. "
+    "Не будь занадто формальним. "
+    "Якщо бракує контексту — постав одне коротке уточнення. "
+    "Завжди відповідай українською."
+)
+
+model = genai.GenerativeModel(
+    model_name='models/gemini-2.5-flash',
+    system_instruction=SYSTEM_STYLE
+)
+
+chat_session = model.start_chat(history=[])
+
+def ask_gemini(user_text: str) -> str:
+    response = chat_session.send_message(user_text)
+    return response.text.strip()
+
+def print_help():
+    print("\n--- Команди ---")
+    print("  /clear - очистити історію діалогу")
+    print("  /exit  - вийти\n")
+
+print("Чат готовий. Напиши повідомлення.")
+print_help()
+
+while True:
+    user_text = input("Ви: ").strip()
+
+    if not user_text:
+        continue
+
+    if user_text == "/clear":
+        chat_session = model.start_chat(history=[])
+        print("Історію очищено.\n")
+        continue
+
+    if user_text == "/exit":
+        print("До зустрічі!")
+        break
+
+    try:
+        answer = ask_gemini(user_text)
+        print(f"Асистент: {answer}\n")
+    except Exception as e:
+        print(f"Виникла помилка: {e}\n")
